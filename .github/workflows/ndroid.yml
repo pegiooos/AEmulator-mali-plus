@@ -4,35 +4,31 @@ on:
   workflow_dispatch:
     inputs:
       upstream_url:
-        description: "Optional: direct URL of the upstream AEmulator source zip"
+        description: "Optional: direct URL of a zip that contains the full upstream project (with app/src/main/assets/engines)"
         required: false
         default: ""
   push:
-    branches: [main]
+    branches: [main, master]
     tags: ["v*"]
 
 permissions:
-  contents: write   # only used to publish a GitHub Release on tags
+  contents: write
 
 env:
+  UPSTREAM_REPO: https://github.com/uxazu/AEmulator.git
   UPSTREAM_OVERRIDE: ${{ inputs.upstream_url }}
-  UPSTREAM_URLS: |
-    https://github.com/uxazu/AEmulator/archive/refs/tags/0.0.0.3.zip
-    https://github.com/uxazu/AEmulator/archive/refs/tags/v0.0.0.3.zip
-    https://github.com/uxazu/AEmulator/archive/refs/heads/main.zip
-    https://github.com/uxazu/AEmulator/archive/refs/heads/master.zip
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
-      # secrets cannot be used in a step-level "if", so expose a flag at job level instead
+      # secrets cannot be used in a step-level "if", so expose a flag here
       HAS_KEYSTORE: ${{ secrets.KEYSTORE_BASE64 != '' }}
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android/ndk 2>/dev/null || true
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           df -h /
 
       - uses: actions/checkout@v4
@@ -42,41 +38,108 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - uses: gradle/actions/setup-gradle@v4
-
       - name: Install Android SDK 36
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platforms;android-36" "build-tools;36.0.0"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses >/dev/null 2>&1 || true
+          "$SDKM" "platforms;android-36" "build-tools;36.0.0"
 
-      # The engine assets (big, not in this repo) come from the upstream AEmulator 0.0.0.3 source (GPL-3.0).
-      # This repo's app/ folder and Gradle files are copied on top of it. No patch file is needed.
+      # The big engine files are not in this repo. They come from the upstream AEmulator 0.0.0.3 by uxazu (GPL-3.0).
+      # Sources are tried in order until one holds real engine files:
+      #   1. the zip from the upstream_url input (manual run)
+      #   2. git clone of the upstream repo (tag 0.0.0.3, v0.0.0.3, default branch) incl. Git LFS files
+      #   3. zip/zipball links found through the upstream releases list
+      # Then this repo's app/ and Gradle files are copied on top. No patch file is needed.
       - name: Get the source
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ -d app/src/main/assets/engines ]; then
-            D=.
-            echo "Full project found in the repo"
-          else
-            ok=0
-            for u in $UPSTREAM_OVERRIDE $UPSTREAM_URLS; do
-              echo "Trying $u"
-              if curl -fsSL --retry 2 -o upstream.zip "$u" && unzip -tq upstream.zip >/dev/null 2>&1; then
-                ok=1; echo "Downloaded OK: $u"; break
+          E=app/src/main/assets/engines
+
+          # true when the folder holds at least one real file (Git LFS pointer stubs are < 200 bytes)
+          has_engines() {
+            [ -d "$1/$E" ] && [ -n "$(find "$1/$E" -type f -size +200c -print -quit)" ]
+          }
+
+          fetch_clone() {
+            rm -rf up
+            git clone -q --depth 1 ${1:+--branch "$1"} "$UPSTREAM_REPO" up || return 1
+            (cd up && git lfs pull) || echo "  (git lfs pull skipped)"
+            rm -rf up/.git
+          }
+
+          fetch_zip() {
+            rm -rf up up.zip zt
+            curl -fsSL --retry 2 -o up.zip "$1" || return 1
+            unzip -tq up.zip >/dev/null 2>&1 || return 1
+            mkdir zt && unzip -q up.zip -d zt && rm -f up.zip
+            if [ "$(ls -A zt | wc -l)" = 1 ] && [ -d "zt/$(ls -A zt)" ]; then
+              mv "zt/$(ls -A zt)" up; rmdir zt
+            else
+              mv zt up
+            fi
+          }
+
+          diag() {
+            {
+              echo "### Could not get the engine files"
+              echo "Looked for real files in \`$E\` of the upstream project and found none."
+              echo
+              echo "Top level of the last upstream copy tried:"
+              echo '```'; ls -A up 2>/dev/null | head -30 || true; echo '```'
+              echo "Upstream releases (name / assets):"
+              echo '```'
+              if command -v jq >/dev/null; then
+                curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/uxazu/AEmulator/releases 2>/dev/null \
+                  | jq -r '.[] | "\(.tag_name): " + ([.assets[]?.name] | join(", "))' | head -20 || true
               fi
-              echo "  failed, next"; rm -f upstream.zip
-            done
-            if [ "$ok" != 1 ]; then
-              echo "::error title=Upstream download failed::None of the upstream URLs worked. Run the workflow manually and put a working zip link in the upstream_url input."
+              echo '```'
+              echo "Fix: put the full project (including \`$E\`) in this repo, or run the workflow manually and give a zip link in **upstream_url**."
+            } >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          if has_engines .; then
+            echo "Full project found in this repo"
+            D=.
+          else
+            found=0
+
+            if [ -n "${UPSTREAM_OVERRIDE:-}" ]; then
+              echo "Trying upstream_url input"
+              if fetch_zip "$UPSTREAM_OVERRIDE" && has_engines up; then found=1; fi
+            fi
+
+            if [ "$found" = 0 ]; then
+              for ref in 0.0.0.3 v0.0.0.3 ""; do
+                echo "Trying git clone (ref: ${ref:-default branch})"
+                if fetch_clone "$ref"; then
+                  if has_engines up; then found=1; echo "  engine files found"; break; fi
+                  echo "  cloned, but no engine files in it"
+                else
+                  echo "  clone failed"
+                fi
+              done
+            fi
+
+            if [ "$found" = 0 ] && command -v jq >/dev/null; then
+              echo "Trying release links from the GitHub API"
+              URLS=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/uxazu/AEmulator/releases 2>/dev/null \
+                | jq -r '.[] | .zipball_url, (.assets[]? | select(.name | endswith(".zip")) | .browser_download_url)' || true)
+              for u in $URLS; do
+                echo "  $u"
+                if fetch_zip "$u" && has_engines up; then found=1; echo "  engine files found"; break; fi
+              done
+            fi
+
+            if [ "$found" = 0 ]; then
+              diag
+              echo "::error title=Engine files not found::No upstream source with real engine files was found. See the run summary for details."
               exit 1
             fi
-            rm -rf src src_tmp
-            mkdir -p src src_tmp
-            unzip -q upstream.zip -d src_tmp
-            shopt -s dotglob
-            mv src_tmp/*/* src/
-            shopt -u dotglob
-            rm -rf src_tmp upstream.zip
+
+            rm -rf src
+            mv up src
             mkdir -p src/app
             cp -a app/. src/app/
             for f in gradlew gradlew.bat settings.gradle.kts build.gradle.kts gradle.properties LICENSE; do
@@ -85,16 +148,13 @@ jobs:
             if [ -d gradle ]; then mkdir -p src/gradle; cp -a gradle/. src/gradle/; fi
             D=src
           fi
+
           test -d "$D/app/src" || { echo "::error::$D has no app/src"; exit 1; }
-          if [ ! -d "$D/app/src/main/assets/engines" ]; then
-            echo "::error title=Engine assets missing::$D/app/src/main/assets/engines was not found. The upstream zip does not contain the engine files; put the full project in the repo or give a zip that has them in upstream_url."
-            ls -la "$D/app/src/main" || true
-            exit 1
-          fi
           echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
+          du -sh "$D/$E" || true
           ls -la "$D"
 
-      # The upstream gradle.properties points Gradle at a Windows JDK path that does not exist on Linux.
+      # The upstream gradle.properties may point Gradle at a Windows JDK path that does not exist on Linux.
       - name: Fix gradle.properties for Linux
         run: |
           sed -i '/^org\.gradle\.java\.home=/d' "$PROJECT_DIR/gradle.properties" || true
@@ -134,8 +194,6 @@ jobs:
             ERR=$(grep -E '^e: |error:|What went wrong|Could not |Execution failed|FAILED|Unresolved|SDK location' -A2 build.log | head -n 40 || true)
             [ -z "$ERR" ] && ERR=$(tail -n 40 build.log)
             { echo '### Build errors'; echo '```'; echo "$ERR"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "No build.log: the build step did not start. See the earlier steps." >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Collect APKs
