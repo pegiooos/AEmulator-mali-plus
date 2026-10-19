@@ -2,21 +2,12 @@ name: Build AEmulator mali+ APK
 
 on:
   workflow_dispatch:
-    inputs:
-      upstream_url:
-        description: "Optional: direct URL of a zip that contains the full upstream project (with app/src/main/assets/engines)"
-        required: false
-        default: ""
   push:
     branches: [main, master]
     tags: ["v*"]
 
 permissions:
   contents: write
-
-env:
-  UPSTREAM_REPO: https://github.com/uxazu/AEmulator.git
-  UPSTREAM_OVERRIDE: ${{ inputs.upstream_url }}
 
 jobs:
   build:
@@ -31,7 +22,10 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/share/boost /opt/hostedtoolcache/CodeQL 2>/dev/null || true
           df -h /
 
+      # Builds THIS repository (pegiooos/AEmulator-mali-plus) as it is. Nothing is downloaded from upstream.
       - uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - uses: actions/setup-java@v4
         with:
@@ -44,129 +38,30 @@ jobs:
           yes | "$SDKM" --licenses >/dev/null 2>&1 || true
           "$SDKM" "platforms;android-36" "build-tools;36.0.0"
 
-      # The big engine files are not in this repo. They come from the upstream AEmulator 0.0.0.3 by uxazu (GPL-3.0).
-      # Sources are tried in order until one holds real engine files:
-      #   1. the zip from the upstream_url input (manual run)
-      #   2. git clone of the upstream repo (tag 0.0.0.3, v0.0.0.3, default branch) incl. Git LFS files
-      #   3. zip/zipball links found through the upstream releases list
-      # Then this repo's app/ and Gradle files are copied on top. No patch file is needed.
-      - name: Get the source
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Check the project is in this repo
         run: |
-          set -euo pipefail
-          E=app/src/main/assets/engines
-
-          # true when the folder holds at least one real file (Git LFS pointer stubs are < 200 bytes)
-          has_engines() {
-            [ -d "$1/$E" ] && [ -n "$(find "$1/$E" -type f -size +200c -print -quit)" ]
-          }
-
-          fetch_clone() {
-            rm -rf up
-            git clone -q --depth 1 ${1:+--branch "$1"} "$UPSTREAM_REPO" up || return 1
-            (cd up && git lfs pull) || echo "  (git lfs pull skipped)"
-            rm -rf up/.git
-          }
-
-          fetch_zip() {
-            rm -rf up up.zip zt
-            curl -fsSL --retry 2 -o up.zip "$1" || return 1
-            unzip -tq up.zip >/dev/null 2>&1 || return 1
-            mkdir zt && unzip -q up.zip -d zt && rm -f up.zip
-            if [ "$(ls -A zt | wc -l)" = 1 ] && [ -d "zt/$(ls -A zt)" ]; then
-              mv "zt/$(ls -A zt)" up; rmdir zt
-            else
-              mv zt up
-            fi
-          }
-
-          diag() {
-            {
-              echo "### Could not get the engine files"
-              echo "Looked for real files in \`$E\` of the upstream project and found none."
-              echo
-              echo "Top level of the last upstream copy tried:"
-              echo '```'; ls -A up 2>/dev/null | head -30 || true; echo '```'
-              echo "Upstream releases (name / assets):"
-              echo '```'
-              if command -v jq >/dev/null; then
-                curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/uxazu/AEmulator/releases 2>/dev/null \
-                  | jq -r '.[] | "\(.tag_name): " + ([.assets[]?.name] | join(", "))' | head -20 || true
-              fi
-              echo '```'
-              echo "Fix: put the full project (including \`$E\`) in this repo, or run the workflow manually and give a zip link in **upstream_url**."
-            } >> "$GITHUB_STEP_SUMMARY"
-          }
-
-          if has_engines .; then
-            echo "Full project found in this repo"
-            D=.
-          else
-            found=0
-
-            if [ -n "${UPSTREAM_OVERRIDE:-}" ]; then
-              echo "Trying upstream_url input"
-              if fetch_zip "$UPSTREAM_OVERRIDE" && has_engines up; then found=1; fi
-            fi
-
-            if [ "$found" = 0 ]; then
-              for ref in 0.0.0.3 v0.0.0.3 ""; do
-                echo "Trying git clone (ref: ${ref:-default branch})"
-                if fetch_clone "$ref"; then
-                  if has_engines up; then found=1; echo "  engine files found"; break; fi
-                  echo "  cloned, but no engine files in it"
-                else
-                  echo "  clone failed"
-                fi
-              done
-            fi
-
-            if [ "$found" = 0 ] && command -v jq >/dev/null; then
-              echo "Trying release links from the GitHub API"
-              URLS=$(curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://api.github.com/repos/uxazu/AEmulator/releases 2>/dev/null \
-                | jq -r '.[] | .zipball_url, (.assets[]? | select(.name | endswith(".zip")) | .browser_download_url)' || true)
-              for u in $URLS; do
-                echo "  $u"
-                if fetch_zip "$u" && has_engines up; then found=1; echo "  engine files found"; break; fi
-              done
-            fi
-
-            if [ "$found" = 0 ]; then
-              diag
-              echo "::error title=Engine files not found::No upstream source with real engine files was found. See the run summary for details."
-              exit 1
-            fi
-
-            rm -rf src
-            mv up src
-            mkdir -p src/app
-            cp -a app/. src/app/
-            for f in gradlew gradlew.bat settings.gradle.kts build.gradle.kts gradle.properties LICENSE; do
-              if [ -f "$f" ]; then cp "$f" src/; fi
-            done
-            if [ -d gradle ]; then mkdir -p src/gradle; cp -a gradle/. src/gradle/; fi
-            D=src
+          missing=0
+          for f in gradlew settings.gradle.kts build.gradle.kts app/build.gradle.kts app/src/main/AndroidManifest.xml; do
+            if [ ! -e "$f" ]; then echo "::error title=Missing file::$f is not in this repo"; missing=1; fi
+          done
+          if [ ! -d app/src/main/assets/engines ]; then
+            echo "::warning title=No engines folder::app/src/main/assets/engines is not in this repo, so the APK will have no engine files"
           fi
+          [ "$missing" = 0 ] || exit 1
+          ls -la
 
-          test -d "$D/app/src" || { echo "::error::$D has no app/src"; exit 1; }
-          echo "PROJECT_DIR=$D" >> "$GITHUB_ENV"
-          du -sh "$D/$E" || true
-          ls -la "$D"
-
-      # The upstream gradle.properties may point Gradle at a Windows JDK path that does not exist on Linux.
+      # A Windows JDK path in gradle.properties does not exist on Linux.
       - name: Fix gradle.properties for Linux
         run: |
-          sed -i '/^org\.gradle\.java\.home=/d' "$PROJECT_DIR/gradle.properties" || true
-          cat "$PROJECT_DIR/gradle.properties"
+          sed -i '/^org\.gradle\.java\.home=/d' gradle.properties || true
+          cat gradle.properties
 
-      # Debug APK: installable with no secrets (Android signs it with the debug key).
+      # Debug APK: installable with no secrets.
       - name: Build debug APK
         run: |
           set -o pipefail
-          cd "$PROJECT_DIR"
           chmod +x gradlew
-          ./gradlew --no-daemon --console=plain assembleStandardDebug 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          ./gradlew --no-daemon --console=plain assembleStandardDebug 2>&1 | tee build.log
 
       # Optional signed release. Add repo secrets: KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD.
       - name: Build signed release APK (only if secrets exist)
@@ -177,7 +72,6 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          cd "$PROJECT_DIR"
           echo "$KEYSTORE_BASE64" | base64 -d > release.jks
           {
             echo "storeFile=release.jks"
@@ -199,7 +93,7 @@ jobs:
       - name: Collect APKs
         run: |
           mkdir -p dist
-          find "$PROJECT_DIR/app/build/outputs/apk" -name '*.apk' -exec cp {} dist/ \;
+          find app/build/outputs/apk -name '*.apk' -exec cp {} dist/ \;
           ls -la dist
 
       - uses: actions/upload-artifact@v4
